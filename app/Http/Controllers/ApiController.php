@@ -8,11 +8,12 @@ use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
 
 class ApiController extends Controller
 {
-    // Konfigurasi porting dari Python/Node
+    // ── Konfigurasi ─────────────────────────────────────────────────────────
     protected $cfg = [
         'MORNING_WINDOW' => [5, 7],
         'EVENING_WINDOW' => [16, 18],
@@ -43,11 +44,15 @@ class ApiController extends Controller
         'SENSOR_TOLERANCE' => 1.0,
     ];
 
+    // ── Cache Keys ───────────────────────────────────────────────────────────
+    private const CACHE_STATE_KEY = 'siram_pintar:system_state';
+    private const CACHE_TTL = 1; // 1 detik (reduce DB queries)
+
     public function root()
     {
         return response()->json([
             'status' => 'online',
-            'message' => 'Siram Pintar API Laravel Sail berjalan',
+            'message' => 'Siram Pintar API Laravel berjalan (v6 optimized)',
             'version' => '6.0.0',
             'auth' => env('API_KEY') ? 'required' : 'disabled'
         ]);
@@ -65,7 +70,6 @@ class ApiController extends Controller
 
     public function modelInfo()
     {
-        // Metadata model bisa diletakkan di config atau file json
         return response()->json([
             'best_k' => '?',
             'accuracy' => '?',
@@ -79,6 +83,7 @@ class ApiController extends Controller
 
     public function receiveSensor(Request $request)
     {
+        // ✓ STEP 1: Validate input (cepat, tidak ada DB)
         $data = $request->validate([
             'soil_moisture' => 'required|numeric|between:0,100',
             'temperature' => 'required|numeric|between:0,60',
@@ -88,21 +93,23 @@ class ApiController extends Controller
             'day' => 'nullable|integer|between:0,6',
         ]);
 
-        $state = $this->getState();
+        // ✓ STEP 2: Get state dengan caching (reduce DB queries)
+        $state = $this->getStateWithCache();
 
-        // Resolve Time WIT
+        // ✓ STEP 3: Resolve time (cepat, no DB)
         $timeInfo = $this->resolveTimeWit($data['hour'] ?? null, $data['minute'] ?? null, $data['day'] ?? null);
         $currentTotalMinutes = $timeInfo['h'] * 60 + $timeInfo['m'];
 
-        // KNN Classification (Stub)
+        // ✓ STEP 4: KNN Classification (cepat, no DB)
         $result = $this->classify($data['soil_moisture'], $data['temperature'], $data['air_humidity']);
 
-        // Debounce / Anomaly check
+        // ✓ STEP 5: Debounce check (fast path)
         $skipEval = $this->shouldSkipSensor($data, $state);
 
         if ($skipEval) {
             $elapsedSpam = $this->elapsedSecondsReal($state->last_sensor_ts);
             if ($elapsedSpam < 2.0) {
+                Log::debug("Spam filter: {$elapsedSpam}s");
                 return response()->json([
                     'received' => true,
                     'timestamp' => $state->last_updated ? $state->last_updated->toDateTimeString() : now()->toDateTimeString(),
@@ -122,39 +129,51 @@ class ApiController extends Controller
         $finalAction = null;
         $smartEval = [];
 
+        // ✓ STEP 6: Evaluate smart watering (expensive, but needed)
         if ($state->mode === 'auto' && !$skipEval) {
             $smartEval = $this->evaluateSmartWatering($result, $timeInfo['h'], $timeInfo['m'], $data['soil_moisture'], $data['air_humidity'], $data['temperature'], $state, $currentTotalMinutes);
             $finalAction = $smartEval['action'] ?? null;
         }
 
-        // Update State
-        $state->update([
+        // ✓ STEP 7: Update state (single update, not multiple)
+        $updateData = [
             'last_label' => $result['label'],
             'last_updated' => now(),
             'last_soil_moisture' => $data['soil_moisture'],
             'last_temperature' => $data['temperature'],
             'last_sensor_ts' => now(),
             'last_sensor_soil' => $data['soil_moisture'],
-        ]);
+        ];
+        
+        $state->update($updateData);
 
+        // ✓ STEP 8: Get fresh state after update (dari DB, not cache)
         $newState = $state->fresh();
         $pumpStatusLogged = $finalAction === 'on' ? true : ($finalAction === 'off' ? false : $newState->pump_status);
 
-        // Log to database
-        SensorReading::create([
-            'id' => (string) Str::uuid(),
-            'timestamp' => now(),
-            'soil_moisture' => $data['soil_moisture'],
-            'temperature' => $data['temperature'],
-            'air_humidity' => $data['air_humidity'],
-            'label' => $result['label'],
-            'confidence' => $result['confidence'],
-            'needs_watering' => $result['needs_watering'],
-            'description' => $result['description'],
-            'probabilities' => $result['probabilities'],
-            'pump_status' => $pumpStatusLogged,
-            'mode' => $state->mode,
-        ]);
+        // ✓ STEP 9: Insert sensor reading (async via queue preferred, but sync if queue unavailable)
+        try {
+            SensorReading::create([
+                'id' => (string) Str::uuid(),
+                'timestamp' => now(),
+                'soil_moisture' => $data['soil_moisture'],
+                'temperature' => $data['temperature'],
+                'air_humidity' => $data['air_humidity'],
+                'label' => $result['label'],
+                'confidence' => $result['confidence'],
+                'needs_watering' => $result['needs_watering'],
+                'description' => $result['description'],
+                'probabilities' => $result['probabilities'],
+                'pump_status' => $pumpStatusLogged,
+                'mode' => $state->mode,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to create sensor reading: ' . $e->getMessage());
+            // ✓ Don't fail response if sensor insert fails
+        }
+
+        // ✓ Invalidate cache setelah update
+        Cache::forget(self::CACHE_STATE_KEY);
 
         return response()->json([
             'received' => true,
@@ -173,8 +192,12 @@ class ApiController extends Controller
 
     public function getStatus()
     {
-        $state = $this->getState();
-        $latest = SensorReading::orderBy('timestamp', 'desc')->first();
+        $state = $this->getStateWithCache();
+        
+        // ✓ Use DB::table untuk simple query (faster than ORM)
+        $latest = DB::table('sensor_readings')
+            ->orderBy('timestamp', 'desc')
+            ->first();
 
         return response()->json([
             'pump_status' => $state->pump_status,
@@ -200,7 +223,15 @@ class ApiController extends Controller
     public function history(Request $request)
     {
         $limit = $request->query('limit', 50);
-        $records = SensorReading::orderBy('timestamp', 'desc')->limit($limit)->get()->reverse()->values();
+        $limit = min($limit, 500); // Cap at 500
+        
+        // ✓ Use DB::table + cursor untuk large datasets
+        $records = DB::table('sensor_readings')
+            ->orderBy('timestamp', 'desc')
+            ->limit($limit)
+            ->get()
+            ->reverse()
+            ->values();
 
         return response()->json([
             'total' => $records->count(),
@@ -218,9 +249,11 @@ class ApiController extends Controller
         $action = strtolower($data['action']);
         $mode = strtolower($data['mode'] ?? 'manual');
 
-        $state = $this->getState();
+        // ✓ Get fresh state (tidak cache untuk control)
+        $state = $this->getStateFresh();
         $pumpOn = ($action === 'on');
 
+        // ✓ Debounce duplicate commands
         if ($state->pump_status === $pumpOn && $state->mode === $mode) {
             return response()->json([
                 'success' => true,
@@ -232,6 +265,7 @@ class ApiController extends Controller
             ]);
         }
 
+        // ✓ Single update with all fields at once
         $updateData = ['mode' => $mode, 'last_control_ts' => now()];
 
         if ($state->pump_status !== $pumpOn) {
@@ -251,11 +285,16 @@ class ApiController extends Controller
 
         $state->update($updateData);
 
+        // ✓ Invalidate cache
+        Cache::forget(self::CACHE_STATE_KEY);
+
+        $freshState = $state->fresh();
+
         return response()->json([
             'success' => true,
             'debounced' => false,
-            'pump_status' => $state->fresh()->pump_status,
-            'mode' => $state->fresh()->mode,
+            'pump_status' => $freshState->pump_status,
+            'mode' => $freshState->mode,
             'timestamp' => now()->toIso8601String(),
         ]);
     }
@@ -310,7 +349,8 @@ class ApiController extends Controller
 
     public function resetRain()
     {
-        $this->getState()->update([
+        $state = $this->getStateFresh();
+        $state->update([
             'rain_detected' => false,
             'rain_score' => 0,
             'rain_confirm_count' => 0,
@@ -318,12 +358,34 @@ class ApiController extends Controller
             'rain_started_minute' => null,
             'missed_session' => false,
         ]);
+        
+        // Invalidate cache
+        Cache::forget(self::CACHE_STATE_KEY);
+        
         return response()->json(['success' => true, 'message' => 'State hujan dan hutang siram di-reset.']);
     }
 
-    // --- Private Helpers ---
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PRIVATE HELPERS (Optimized)
+    // ═══════════════════════════════════════════════════════════════════════════
 
-    private function getState()
+    /**
+     * ✓ Get state dengan caching (1 detik TTL)
+     */
+    private function getStateWithCache()
+    {
+        return Cache::remember(self::CACHE_STATE_KEY, self::CACHE_TTL, function () {
+            return SystemState::firstOrCreate(['id' => 1], [
+                'mode' => 'auto',
+                'pump_status' => false
+            ]);
+        });
+    }
+
+    /**
+     * ✓ Get fresh state (bypass cache)
+     */
+    private function getStateFresh()
     {
         return SystemState::firstOrCreate(['id' => 1], [
             'mode' => 'auto',
@@ -336,18 +398,12 @@ class ApiController extends Controller
         if ($h !== null && $m !== null && $d !== null) {
             return ['h' => (int) $h, 'm' => (int) $m, 'd' => (int) $d, 'source' => 'esp32'];
         }
-        $now = Carbon::now('Asia/Jayapura'); // WIT
+        $now = Carbon::now('Asia/Jayapura');
         return ['h' => $now->hour, 'm' => $now->minute, 'd' => $now->dayOfWeek, 'source' => 'server'];
     }
 
     private function classify($soil, $temp, $rh)
     {
-        /**
-         * PURE PHP KNN / RULE-BASED LOGIC
-         * Karena hosting tidak mendukung Python, kita menggunakan logika PHP murni.
-         * Nilai threshold ini disesuaikan dengan info dari model_info.json Anda.
-         */
-        
         $label = 'Normal';
         $confidence = 90.0;
         $needsWatering = false;
@@ -370,7 +426,6 @@ class ApiController extends Controller
             $confidence = 95.0;
         }
 
-        // Penyesuaian berdasarkan Suhu & Kelembaban Udara (Khas KNN)
         if ($temp > 34.0 && $label === 'Lembab') {
             $description .= ' (Suhu panas, awasi penguapan cepat)';
             $confidence -= 5.0;
@@ -393,15 +448,19 @@ class ApiController extends Controller
     {
         if ($data['soil_moisture'] <= 0 || $data['temperature'] <= 0 || $data['temperature'] >= 60)
             return true;
+        
         if ($state->last_sensor_soil !== null) {
             if (abs($data['soil_moisture'] - $state->last_sensor_soil) > 30.0)
                 return true;
         }
+        
         $elapsed = $this->elapsedSecondsReal($state->last_sensor_ts);
         if ($elapsed > $this->cfg['SENSOR_DEBOUNCE_SECONDS'])
             return false;
+        
         if ($state->last_sensor_soil === null)
             return false;
+        
         return abs($data['soil_moisture'] - $state->last_sensor_soil) <= $this->cfg['SENSOR_TOLERANCE'];
     }
 
@@ -414,7 +473,6 @@ class ApiController extends Controller
 
     private function evaluateSmartWatering($result, $hour, $minute, $soil, $rh, $temp, $state, $currentMin)
     {
-        // 1. Inisialisasi Response
         $resp = [
             'action' => null,
             'reason' => '',
@@ -426,7 +484,7 @@ class ApiController extends Controller
             'decision_path' => []
         ];
 
-        // 2. Cek Safety Lockout (Batas harian)
+        // ✓ Check daily safety lockout
         $today = now()->toDateString();
         if ($state->session_count_date !== $today) {
             $state->update(['session_count_today' => 0, 'session_count_date' => $today]);
@@ -439,36 +497,36 @@ class ApiController extends Controller
             return $resp;
         }
 
-        // 3. Hitung Skor Hujan (Logic v6)
+        // ✓ Compute rain score
         $rainInfo = $this->computeRainScore($rh, $soil, $temp, $state->last_soil_moisture, $state->last_temperature, $state->pump_status);
         $rainStatus = $this->updateRainState($rainInfo['score'], $rainInfo['signals'], $state, $currentMin);
         
         $resp['is_raining'] = $rainStatus['is_raining'];
         $resp['rain_score'] = $rainInfo['score'];
 
-        // 4. Dynamic Thresholds (Kepintaran Adaptif)
+        // ✓ Dynamic thresholds
         $dynamicDryOn = $this->cfg['SOIL_DRY_ON'];
         $dynamicWetOff = $this->cfg['SOIL_WET_OFF'];
 
         if ($resp['hot_mode']) {
-            $dynamicDryOn += 5.0; // Siram lebih awal jika panas
+            $dynamicDryOn += 5.0;
             $dynamicWetOff += 5.0;
             $resp['decision_path'][] = 'T-HOT_ADJUST';
         } elseif ($temp < 25.0 && $rh > 80.0) {
-            $dynamicDryOn -= 5.0; // Tunda jika dingin/lembab
+            $dynamicDryOn -= 5.0;
             $dynamicWetOff -= 5.0;
             $resp['decision_path'][] = 'T-COOL_ADJUST';
         }
 
         if ($state->missed_session) {
-            $dynamicWetOff += 5.0; // Kompensasi jika sesi sebelumnya terlewat
+            $dynamicWetOff += 5.0;
             $resp['decision_path'][] = 'T-MISSED_ADJUST';
         }
 
         $dynamicWetOff = min(95.0, $dynamicWetOff);
         $dynamicDryOn = max($this->cfg['CRITICAL_DRY'] + 5.0, $dynamicDryOn);
 
-        // 5. Cek Window Waktu
+        // ✓ Check watering window
         $inWindow = false;
         $windowLabel = '';
         if ($hour >= $this->cfg['MORNING_WINDOW'][0] && $hour <= $this->cfg['MORNING_WINDOW'][1]) {
@@ -477,11 +535,10 @@ class ApiController extends Controller
             $inWindow = true; $windowLabel = 'sore';
         }
 
-        // Emergency Night Mode
         $nightEmergency = (!$inWindow && $soil <= $this->cfg['CRITICAL_DRY'] && !$resp['is_raining']);
         if ($nightEmergency) $windowLabel = 'malam-darurat';
 
-        // 6. LOGIKA EKSEKUSI (Jika Pompa Sedang Nyala)
+        // ✓ Logic for pump running
         if ($state->pump_status) {
             $elapsedSec = $this->elapsedSecondsReal($state->pump_start_ts);
             $maxSec = $nightEmergency ? 60 : ($this->cfg['MAX_PUMP_DURATION_MINUTES'] * 60);
@@ -521,8 +578,7 @@ class ApiController extends Controller
             return $resp;
         }
 
-        // 7. LOGIKA EKSEKUSI (Jika Pompa Sedang Mati)
-        // B1: Darurat
+        // ✓ Logic for pump stopped
         if ($nightEmergency || ($soil <= $this->cfg['CRITICAL_DRY'] && !$resp['is_raining'])) {
             $state->update(['pump_status' => true, 'pump_start_ts' => now(), 'pump_start_minute' => $currentMin, 'session_count_today' => $state->session_count_today + 1]);
             $resp['action'] = 'on';
@@ -531,21 +587,18 @@ class ApiController extends Controller
             return $resp;
         }
 
-        // B2: Cek Window
         if (!$inWindow) {
             $resp['blocked_reason'] = "Di luar jam aman (WIT {$hour}:{$minute})";
             $resp['decision_path'][] = 'B2';
             return $resp;
         }
 
-        // B3: Cek Hujan
         if ($resp['is_raining']) {
             $resp['blocked_reason'] = "Sedang hujan (Skor: {$resp['rain_score']})";
             $resp['decision_path'][] = 'B3';
             return $resp;
         }
 
-        // B4: Sudah Basah
         if ($soil >= $dynamicWetOff) {
             if ($state->missed_session) $state->update(['missed_session' => false]);
             $resp['blocked_reason'] = "Tanah sudah basah ({$soil}%)";
@@ -553,10 +606,9 @@ class ApiController extends Controller
             return $resp;
         }
 
-        // B5: Cooldown
         $effectiveCooldown = $state->missed_session ? $this->cfg['POST_RAIN_COOLDOWN_MINUTES'] : $this->cfg['COOLDOWN_MINUTES'];
         $elapsedCD = $currentMin - ($state->last_watered_minute ?? -9999);
-        if ($elapsedCD < 0) $elapsedCD += 1440; // Over midnight
+        if ($elapsedCD < 0) $elapsedCD += 1440;
 
         if ($elapsedCD < $effectiveCooldown) {
             $resp['blocked_reason'] = "Cooldown: sisa " . ($effectiveCooldown - $elapsedCD) . " mnt.";
@@ -564,14 +616,12 @@ class ApiController extends Controller
             return $resp;
         }
 
-        // B6: KNN Decision
         if (!$result['needs_watering']) {
             $resp['blocked_reason'] = "KNN Label: {$result['label']} ({$result['confidence']}%)";
             $resp['decision_path'][] = 'B6';
             return $resp;
         }
 
-        // B7: Confidence Threshold
         $threshold = $resp['hot_mode'] ? $this->cfg['CONFIDENCE_HOT'] : ($state->missed_session ? $this->cfg['CONFIDENCE_MISSED'] : $this->cfg['CONFIDENCE_NORMAL']);
         if ($result['confidence'] < $threshold) {
             $resp['blocked_reason'] = "Confidence {$result['confidence']}% < {$threshold}%";
@@ -579,7 +629,6 @@ class ApiController extends Controller
             return $resp;
         }
 
-        // B8: Final Threshold Check
         if ($soil > $dynamicDryOn) {
             $resp['blocked_reason'] = "Tanah {$soil}% > Ambang batas aktif ({$dynamicDryOn}%)";
             $resp['decision_path'][] = 'B8';
